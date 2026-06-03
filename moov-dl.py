@@ -22,10 +22,6 @@ def err(msg):
 	print(msg)
 	traceback.print_exc()
 
-def check_url(url):
-	match = re.match(r'https?://moov.hk/#/album/([A-Z\d]{13})', url)
-	return match.group(1)
-
 def parse_cfg():
 	with open('config.json') as f:
 		return json.load(f)
@@ -112,7 +108,7 @@ def dir_setup(path):
 	if not os.path.isdir(path):
 		os.makedirs(path)
 
-def parse_meta(src, meta=None, num=None, total=None, url=None):
+def parse_album_meta(src, meta=None, num=None, total=None, url=None):
 	# Set tracktotal / num manually in case of disked albums.
 	if meta:
 		meta['artist'] = ", ".join(a.get('name') for a in src['artists'])
@@ -139,6 +135,31 @@ def parse_meta(src, meta=None, num=None, total=None, url=None):
 		}
 	return meta
 
+def parse_chart_meta(src, total=None, url=None):
+	meta={
+		'chartTitle': src[cfg['meta_language']][0],
+		'tracktotal': total
+	}
+	return meta
+
+def parse_playlist_meta(src, total=None, url=None):
+	meta={
+		'playlistTitle': src[cfg['meta_language']][0],
+		'tracktotal': total
+	}
+	return meta
+
+def parse_chart_num_meta(src, num=None, total=None, url=None):
+	# Set tracktotal / num manually in case of disked albums.
+	meta={
+		'artist': src.get('artist'),
+		'title' : src.get('productTitle'),
+		'track' : num,
+	    'track_padded' : str(num).zfill(2),
+		'tracktotal' : total
+	}
+	return meta
+
 def query_quals(qualities):
 	qualities = qualities.split(',')
 	if cfg['quality'] == "HR" and "HR" in qualities:
@@ -155,13 +176,17 @@ def write_cov(cov_abs, url):
 		f.write(r.content)
 
 def decrypt(segment, content_key):
-	sec = "F4:8E:09:CE:54:F7SeCrEtKkK"
-	m = hashlib.md5()
-	m.update((content_key + sec).encode('UTF-8'))
-	key = bytes.fromhex(m.hexdigest())
-	iv = b'\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x01'
-	cipher = AES.new(key, AES.MODE_CBC, iv)
-	return cipher.decrypt(segment)
+    sec = "F4:8E:09:CE:54:F7SeCrEtKkK"
+    m = hashlib.md5()
+    m.update((content_key + sec).encode('UTF-8'))
+    key = bytes.fromhex(m.hexdigest())
+    iv = b'\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x01'
+    cipher = AES.new(key, AES.MODE_CBC, iv)
+    decrypted = cipher.decrypt(segment)
+    try:
+        return unpad(decrypted, AES.block_size)  # Strip PKCS7 padding
+    except ValueError:
+        return decrypted  # Not padded, return as-is
 
 def concat(paths, pre_path):
 	concat_path = os.path.join('moov-dl_tmp', 'concat.txt')
@@ -231,10 +256,11 @@ def clean_up():
 	for fname in os.listdir('moov-dl_tmp'):
 		os.remove(os.path.join('moov-dl_tmp', fname))
 
-def main(alb_id, url):
+def downloadAlbum(alb_id, url):
+	print("Downloading album")
 	alb_meta = client.get_album_meta(alb_id)
 	total = len(alb_meta['modules'][0]['products'])
-	parsed_alb_meta = parse_meta(alb_meta, total=total, url=url)
+	parsed_alb_meta = parse_album_meta(alb_meta, total=total, url=url)
 	alb_fol = "{} - {}".format(parsed_alb_meta['albumartist'], parsed_alb_meta['album'])
 	alb_path = os.path.join(cfg['output_dir'], sanitize(alb_fol))
 	cov_path = os.path.join(alb_path, 'cover.jpg')
@@ -242,7 +268,7 @@ def main(alb_id, url):
 	print(alb_fol)
 	for num, track in enumerate(alb_meta['modules'][0]['products'], 1):
 		try:
-			parsed_meta = parse_meta(track, meta=parsed_alb_meta, num=num)
+			parsed_meta = parse_album_meta(track, meta=parsed_alb_meta, num=num)
 			post_path = os.path.join(alb_path, sanitize(parse_template(parsed_meta)) + ".flac")
 			if os.path.isfile(post_path):
 				print("Track already exists locally.")
@@ -253,6 +279,96 @@ def main(alb_id, url):
 			download(file_meta, parsed_meta, pre_path)
 			try:
 				write_cov(cov_path, alb_meta['images'][0]['path'])
+			except HTTPError:
+				err('Failed to get cover.')
+				cov_path = None
+			except OSError:
+				err('Failed to write cover.')
+				cov_path = None
+			write_tags(pre_path, parsed_meta, cov_path)
+			try:
+				os.rename(pre_path, post_path)
+			except OSError:
+				err('Failed to rename track.')
+			if cfg['lyrics']:
+				try:
+					write_lyrics(track['productId'], post_path)
+				except Exception:
+					err('Failed to write lyrics.')
+		except Exception:
+			err('Failed to rip track.')
+	if cov_path and not cfg['keep_cover']:
+		if os.path.isfile(cov_path):
+			os.remove(cov_path)
+
+def downloadChart(playlist_id, url):
+	print("Downloading chart")
+	chart_meta = client.get_chart_meta(playlist_id)
+	total = len(chart_meta['modules'][0]['chartItems'])
+	parsed_chart_meta = parse_chart_meta(chart_meta, total=total, url=url)
+	chart_fol = "{}".format(parsed_chart_meta['chartTitle']) # Maybe use date
+	chart_path = os.path.join(cfg['output_dir'], sanitize(chart_fol))
+	dir_setup(chart_path)
+	print(chart_fol)
+	for num, track in enumerate(chart_meta['modules'][0]['chartItems'], 1):
+		try:
+			parsed_meta = parse_chart_num_meta(track, num=num, total=total)
+			post_path = os.path.join(chart_path, sanitize(parse_template(parsed_meta)) + ".flac")
+			if os.path.isfile(post_path):
+				print("Track already exists locally.")
+				continue
+			pre_path = os.path.join(chart_path, str(num) + ".flac")
+			quality = query_quals(track['qualities'])
+			file_meta = client.get_file_meta(track['productId'], quality)
+			download(file_meta, parsed_meta, pre_path)
+			cov_path = os.path.join(chart_path, sanitize(parse_template(parsed_meta)) + '-cover.jpg')
+			try:
+				write_cov(cov_path, track['thumbnail'])
+			except HTTPError:
+				err('Failed to get cover.')
+				cov_path = None
+			except OSError:
+				err('Failed to write cover.')
+				cov_path = None
+			write_tags(pre_path, parsed_meta, cov_path)
+			try:
+				os.rename(pre_path, post_path)
+			except OSError:
+				err('Failed to rename track.')
+			if cfg['lyrics']:
+				try:
+					write_lyrics(track['productId'], post_path)
+				except Exception:
+					err('Failed to write lyrics.')
+		except Exception:
+			err('Failed to rip track.')
+	if cov_path and not cfg['keep_cover']:
+		if os.path.isfile(cov_path):
+			os.remove(cov_path)
+
+def downloadPlaylist(playlist_id, url):
+	print("Downloading playlist")
+	playlist_meta = client.get_playlist_meta(playlist_id)
+	total = len(playlist_meta['modules'][1]['products'])
+	parsed_playlist_meta = parse_playlist_meta(playlist_meta, total=total, url=url)
+	playlist_fol = "{}".format(parsed_playlist_meta['playlistTitle']) # Maybe use date
+	playlist_path = os.path.join(cfg['output_dir'], sanitize(playlist_fol))
+	dir_setup(playlist_path)
+	print(playlist_fol)
+	for num, track in enumerate(playlist_meta['modules'][1]['products'], 1):
+		try:
+			parsed_meta = parse_chart_num_meta(track, num=num, total=total)
+			post_path = os.path.join(playlist_path, sanitize(parse_template(parsed_meta)) + ".flac")
+			if os.path.isfile(post_path):
+				print("Track already exists locally.")
+				continue
+			pre_path = os.path.join(playlist_path, str(num) + ".flac")
+			quality = query_quals(track['qualities'])
+			file_meta = client.get_file_meta(track['productId'], quality)
+			download(file_meta, parsed_meta, pre_path)
+			cov_path = os.path.join(playlist_path, sanitize(parse_template(parsed_meta)) + '-cover.jpg')
+			try:
+				write_cov(cov_path, track['thumbnail'])
 			except HTTPError:
 				err('Failed to get cover.')
 				cov_path = None
@@ -297,14 +413,26 @@ if __name__ == '__main__':
 	auth()
 	total = len(cfg['urls'])
 	for num, url in enumerate(cfg['urls'], 1):
-		print("\nAlbum {} of {}:".format(num, total))
-		try:
-			alb_id = check_url(url)
-		except AttributeError:
+		print("\nURLs {} of {}:".format(num, total))
+
+		matchedAlbum = re.match(r'https?://moov.hk/#/album/([A-Z\d]{13})', url)
+		matchedChart = re.match(r'https?://moov.hk/#/chart/([A-Z\d]{12})', url)
+		matchedPlaylist = re.match(r'https?://moov.hk/#/playlist/([A-Z\d]{12})', url)
+
+		if matchedAlbum is None and matchedChart is None and matchedPlaylist is None:
 			print("Invalid url:", url)
 			continue
+
 		try:
-			main(alb_id, url)
+			if bool(matchedAlbum):
+				id = matchedAlbum.group(1)
+				downloadAlbum(id, url)
+			if bool(matchedChart):
+				id = matchedChart.group(1)
+				downloadChart(id, url)
+			if bool(matchedPlaylist):
+				id = matchedPlaylist.group(1)
+				downloadPlaylist(id, url)
 		except KeyboardInterrupt:
 			pass
 		except Exception:
